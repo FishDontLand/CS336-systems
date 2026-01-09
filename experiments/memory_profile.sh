@@ -7,7 +7,7 @@ PYTHON="/lambda/nfs/CS336/CS336-systems/.venv/bin/python"
 mkdir -p "$LOG_DIR"
 
 # Fixed args as a string (exportable)
-FIXED_ARGS="--vocab_size 10000 --d_model 2560 --d_ff 10240 --num_layer 32 --num_heads 32 --theta 10000 --batch_size 4 --warmup_steps 5 --num_measures 1 --record_memory_usage true"
+FIXED_ARGS="--vocab_size 10000 --d_model 2560 --d_ff 10240 --num_layer 32 --num_heads 32 --theta 10000 --batch_size 4 --warmup_steps 5 --num_measures 1 --record_memory_usage"
 export FIXED_ARGS
 
 CONTEXT_LENGTH=(128 256 512 1024)
@@ -29,13 +29,18 @@ for length in "${CONTEXT_LENGTH[@]}"; do
     export SUB_SUB_DIR
     ERROR_LOG="$SUB_SUB_DIR/errors.log"
     for cast_precision in "${CAST_PRECISIONS[@]}";do
-      export USE_MIX_PRECISION="$cast_precision"
-      if [[ "$forward_only" == "true" ]]; then
-        echo "Run: --context_length $LENGTH --forward_only true --use_mixed_precision $USE_MIX_PRECISION"
-        "$PYTHON" ../cs336_systems/monitoring.py $FIXED_ARGS --context_length $LENGTH --forward_only true --use_mixed_precision $USE_MIX_PRECISION --memory_log_path $SUB_SUB_DIR 2>>"$ERROR_LOG"
+      if [[ "$forward_only" == "true" && "$cast_precision" == "true" ]]; then
+        echo "Run: --context_length $LENGTH --forward_only --use_mixed_precision"
+        "$PYTHON" ../cs336_systems/monitoring.py $FIXED_ARGS --context_length $LENGTH --forward_only --use_mixed_precision --memory_log_path $SUB_SUB_DIR 2>>"$ERROR_LOG"
+      elif [[ "$forward_only" == "true" && "$cast_precision" == "false" ]]; then
+        echo "Run: --context_length $LENGTH --forward_only"
+        "$PYTHON" ../cs336_systems/monitoring.py $FIXED_ARGS --context_length $LENGTH --forward_only --memory_log_path $SUB_SUB_DIR 2>>"$ERROR_LOG"
+      elif [[ "$forward_only" == "false" && "$cast_precision" == "true" ]]; then
+        echo "Run: --context_length $LENGTH --use_mixed_precision"
+        "$PYTHON" ../cs336_systems/monitoring.py $FIXED_ARGS --context_length $LENGTH --use_mixed_precision --memory_log_path $SUB_SUB_DIR 2>>"$ERROR_LOG"
       else
-        echo "Run: --context_length $LENGTH --use_mixed_precision $USE_MIX_PRECISION"
-        "$PYTHON" ../cs336_systems/monitoring.py $FIXED_ARGS --context_length $LENGTH --use_mixed_precision $USE_MIX_PRECISION --memory_log_path $SUB_SUB_DIR 2>>"$ERROR_LOG"
+        echo "Run: --context_length $LENGTH"
+        "$PYTHON" ../cs336_systems/monitoring.py $FIXED_ARGS --context_length $LENGTH --memory_log_path $SUB_SUB_DIR 2>>"$ERROR_LOG"
       fi
       done
     done

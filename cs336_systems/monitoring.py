@@ -64,8 +64,8 @@ def monitor_transformer(vocab_size: int, d_model: int, d_ff: int, num_layers: in
                     optim.step()
 
         if record_memory_usage:
-            file_name = f'memory_snapshot_mixed_precision_{use_mixed_precision}.pickle"'
-            torch.cuda.memory._dump_snapshot(memory_log_path + file_name)
+            file_name = f'memory_snapshot_mixed_precision_{use_mixed_precision}.pickle'
+            torch.cuda.memory._dump_snapshot(memory_log_path + '/' + file_name)
             torch.cuda.memory._record_memory_history(enabled=None)
 
         print("forward pass times")
@@ -90,10 +90,10 @@ if __name__ == "__main__":
     parser.add_argument("--context_length", type=int, required=True)
     parser.add_argument("--batch_size", type=int, required=True)
     parser.add_argument("--warmup_steps", type=int, required=True)
-    parser.add_argument("--forward_only", type=bool, default=False)
+    parser.add_argument("--forward_only", action="store_true")
     parser.add_argument("--num_measures", type=int, required=True)
-    parser.add_argument("--use_mixed_precision", type=bool, default=False)
-    parser.add_argument("--record_memory_usage", type=bool, default=False)
+    parser.add_argument("--use_mixed_precision", action="store_true")
+    parser.add_argument("--record_memory_usage", action="store_true")
     parser.add_argument("--memory_log_path", type=str, default=None)
 
     args = parser.parse_args()
