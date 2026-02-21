@@ -1,4 +1,5 @@
 import argparse
+import sys
 
 import cs336_basics.module as module
 import cs336_basics.optimizer as optimizer
@@ -14,10 +15,12 @@ def monitor_transformer(vocab_size: int, d_model: int, d_ff: int, num_layers: in
                         theta: float, context_length: int, batch_size: int, warmup_steps:int,
                         num_measures: int, forward_only: bool=False,
                         use_mixed_precision: bool=False, record_memory_usage: bool=False,
-                        memory_log_path: str|None=None):
+                        memory_log_path: str|None=None, compile_model: bool=False):
     print("Model Params: ", {"d_model": d_model, "d_ff": d_ff, "num_layers": num_layers, "num_heads": num_heads})
-    device = torch.device("cuda:0")
+    device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
     lm = module.TransformerLM(vocab_size, d_model, num_layers, num_heads, d_ff, context_length, theta, device=device)
+    if compile_model:
+        lm = torch.compile(lm)
 
     rng = np.random.default_rng()
     random_data = rng.integers(0, vocab_size, size=(batch_size, context_length + 1))
@@ -30,7 +33,8 @@ def monitor_transformer(vocab_size: int, d_model: int, d_ff: int, num_layers: in
     context = torch.autocast(device_type = device.type, dtype=torch.bfloat16) if use_mixed_precision else nullcontext()
     with context:
         for _ in range(warmup_steps):
-            optim.zero_grad()
+            if not forward_only:
+                optim.zero_grad()
             output = lm(batch_input)
             if not forward_only:
                 loss = cross_entropy(output, batch_target)
@@ -39,25 +43,33 @@ def monitor_transformer(vocab_size: int, d_model: int, d_ff: int, num_layers: in
 
         forward_times = []
         backward_times = []
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         if record_memory_usage:
             torch.cuda.memory._record_memory_history(max_entries=100000)
+
         for _ in range(num_measures):
-            optim.zero_grad()
+            if not forward_only:
+                optim.zero_grad()
             start = timeit.default_timer()
             with nvtx.range("forward pass"):
                 output = lm(batch_input)
-                torch.cuda.synchronize()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
             end = timeit.default_timer()
 
             forward_times.append(end - start)
             if not forward_only:
                 loss = cross_entropy(output, batch_target)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+
                 start = timeit.default_timer()
                 with nvtx.range("backward pass"):
                     loss.backward()
-                    torch.cuda.synchronize()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
                 end = timeit.default_timer()
                 backward_times.append(end - start)
                 with nvtx.range("param update"):
@@ -77,6 +89,22 @@ def monitor_transformer(vocab_size: int, d_model: int, d_ff: int, num_layers: in
             print(backward_times)
             print("mean: ", np.mean(backward_times), " std: ", np.std(backward_times))
 
+    return {
+        "forward": {
+            'mean': np.mean(forward_times),
+            'std': np.std(forward_times),
+        }
+    } if forward_only else {
+        "forward": {
+            'mean': np.mean(forward_times),
+            'std': np.std(forward_times),
+        },
+        "backward": {
+            'mean': np.mean(backward_times),
+            'std': np.std(backward_times),
+        }
+    }
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -95,6 +123,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_mixed_precision", action="store_true")
     parser.add_argument("--record_memory_usage", action="store_true")
     parser.add_argument("--memory_log_path", type=str, default=None)
+    parser.add_argument("--compile_model", action="store_true")
 
     args = parser.parse_args()
     monitor_transformer(**vars(args))
