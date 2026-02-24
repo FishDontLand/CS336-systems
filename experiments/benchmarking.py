@@ -51,20 +51,23 @@ def benchmark_model(compile_model:bool=False):
 def benchmark_attention(compile_layer: bool=False):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     warmup_steps = 10
-    # num_runs = 100
-    num_runs = 20
-    batch_size = 8
+    num_runs = 100
+    # code for debug purpose
+    # num_runs = 20
+    batch_size = 16
     torch.manual_seed(42)
-    # d_model_lst = [16, 32, 64, 128]
-    # context_length_lst = [256, 1024, 4096, 8192, 16384]
-    d_model_lst = [4, 8]
-    context_length_lst = [16, 32]
+    d_model_lst = [16, 32, 64, 128]
+    context_length_lst = [256, 1024, 4096, 8192, 16384]
+    # below is the code for debug purpose
+    # d_model_lst = [4, 8]
+    # context_length_lst = [16, 32]
     forward_time_table = [[None] * len(context_length_lst) for _ in range(len(d_model_lst))]
     backward_time_table = [[None] * len(context_length_lst) for _ in range(len(d_model_lst))]
 
 
     for d_model_idx, d_model in enumerate(d_model_lst):
         for context_len_idx, context_length in enumerate(context_length_lst):
+            print(f"Working on d_model: {d_model}, context_length: {context_length}")
             forward_run_times = []
             backward_run_times = []
 
@@ -92,8 +95,12 @@ def benchmark_attention(compile_layer: bool=False):
 
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
-                    torch.cuda.memory._dump_snapshot(f"d_model_{d_model}_ctx_len_{context_length}_forward_memory.pickle")
-                    torch.cuda._record_memory_history(enabled=None)
+                    if compile_layer:
+                        save_path = f"../outputs/memory_logs/compiled/d_model_{d_model}_ctx_len_{context_length}_forward_memory.pickle"
+                    else:
+                        save_path = f"../outputs/memory_logs/d_model_{d_model}_ctx_len_{context_length}_forward_memory.pickle"
+                    torch.cuda.memory._dump_snapshot(save_path)
+                    torch.cuda.memory._record_memory_history(enabled=None)
 
                 for _ in range(warmup_steps):
                     output = attn_layer(embedded_seq)
@@ -107,6 +114,8 @@ def benchmark_attention(compile_layer: bool=False):
                 for _ in range(num_runs):
                     output =  attn_layer(embedded_seq)
                     result = output.sum()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
 
                     start = timeit.default_timer()
                     result.backward()
@@ -121,10 +130,11 @@ def benchmark_attention(compile_layer: bool=False):
                 backward_time_table[d_model_idx][context_len_idx] = np.mean(backward_run_times)
 
             except Exception as e:
-                raise e
-                if torch.cuda.is_available():
-                    torch.cuda.memory_record_memory_history(enabled=None)
                 print(e)
+                if torch.cuda.is_available():
+                    torch.cuda.memory._record_memory_history(enabled=None)
+            finally:
+                print("="* 20, "Finished", '=' * 20)
 
     column_idx = pd.Index(context_length_lst, name="context_length")
     row_idx = pd.Index(d_model_lst, name="d_model")
