@@ -1,9 +1,15 @@
 import timeit
 
+import einx
 import numpy as np
 import torch
+import triton
 
 from cs336_basics.module import MultiheadSelfAttention
+
+from cs336_basics.utils import scaled_dot_product_attention
+
+from cs336_systems.FlashAttention import TritonFlashAttention
 from cs336_systems.monitoring import monitor_transformer
 import pandas as pd
 
@@ -148,7 +154,102 @@ def benchmark_attention(compile_layer: bool=False):
     print("backward time")
     print(backward_time_table)
 
+def vanilla_attn(q, k, v):
+    seq_len = q.size(-2)
+    masks = torch.ones(seq_len, seq_len, dtype=torch.bool, device=q.device)
+    masks = torch.triu(masks).transpose(0, 1)
+    masks = einx.logical_and('..., q_len k_len -> ... q_len k_len',
+                             torch.ones(k.size()[:-2], dtype=torch.bool, device=q.device), masks)
+
+    output = scaled_dot_product_attention(q, k, v, masks)
+    return output
+
+def benchmarking_flash():
+    device = torch.device('cuda:0')
+    warmup_steps = 10
+    num_runs = 100
+    batch_size = 1
+    torch.manual_seed(34)
+    d_model_lst = [16, 32, 64, 128]
+    context_length_lst = [2 ** i for i in range(7, 17)]
+    dtype_lst = [torch.float32, torch.bfloat16]
+
+    for dtype in dtype_lst:
+        vanilla_forward_time_table = [[None] * len(context_length_lst) for _ in range(len(d_model_lst))]
+        vanilla_full_pass_time_table = [[None] * len(context_length_lst) for _ in range(len(d_model_lst))]
+        flash_forward_time_table = [[None] * len(context_length_lst) for _ in range(len(d_model_lst))]
+        flash_full_pass_time_table = [[None] * len(context_length_lst) for _ in range(len(d_model_lst))]
+        for d_model_idx, d_model in enumerate(d_model_lst):
+            for context_len_idx, context_len in enumerate(context_length_lst):
+                Q = torch.randn(batch_size, context_len, d_model, device=device, dtype=dtype, requires_grad=True)
+                K = torch.randn(batch_size, context_len, d_model, device=device, dtype=dtype, requires_grad=True)
+                V = torch.randn(batch_size, context_len, d_model, device=device, dtype=dtype, requires_grad=True)
+                dO = torch.randn(batch_size, context_len, d_model, device=device, dtype=dtype)
+
+                try:
+                    time = triton.testing.do_bench(lambda: vanilla_attn(Q, K, V), warmup=warmup_steps,
+                                                 rep=num_runs)
+                except:
+                    time = float('inf')
+
+                vanilla_forward_time_table[d_model_idx][context_len_idx] = time
+
+                try:
+                    time = triton.testing.do_bench(lambda: TritonFlashAttention.apply(Q, K, V, True),
+                                                   warmup=warmup_steps, rep=num_runs)
+                except:
+                    time=float('inf')
+
+                flash_forward_time_table[d_model_idx][context_len_idx] = time
+
+                try:
+                    time = triton.testing.do_bench(lambda: vanilla_attn(Q, K, V).backward(dO), warmup=warmup_steps,
+                                                   rep=num_runs, grad_to_none=[Q, K, V])
+                except:
+                    time = float('inf')
+
+                vanilla_full_pass_time_table[d_model_idx][context_len_idx] = time
+
+                try:
+                    time = triton.testing.do_bench(lambda: TritonFlashAttention.apply(Q, K, V, True),
+                                                   warmup=warmup_steps, rep=num_runs, grad_to_none=[Q, K, V])
+                except:
+                    time = float('inf')
+
+                flash_full_pass_time_table[d_model_idx][context_len_idx] = time
+
+        vanilla_forward_time_table = pd.DataFrame(vanilla_forward_time_table,
+                                                  index=pd.Index(d_model_lst, name="d_model"),
+                                                  columns=pd.Index(context_length_lst, name="context_length"))
+
+        flash_forward_time_table = pd.DataFrame(flash_forward_time_table,
+                                                index=pd.Index(d_model_lst, name="d_model"),
+                                                columns=pd.Index(context_length_lst, name="context_length"))
+
+        vanilla_full_pass_time_table = pd.DataFrame(vanilla_full_pass_time_table,
+                                                    index=pd.Index(d_model_lst, name="d_model"),
+                                                    columns=pd.Index(context_length_lst, name="context_length"))
+
+        flash_full_pass_time_table = pd.DataFrame(flash_full_pass_time_table,
+                                                  index=pd.Index(d_model_lst, name="d_model"),
+                                                  columns=pd.Index(context_length_lst, name="context_length"))
+
+        forward_time_table = pd.concat({'vanilla': vanilla_forward_time_table,
+                                        'flash_attn': flash_forward_time_table}, axis=1)
+        forward_time_table = forward_time_table.swaplevel(0, 1, axis=1).sort_index(axis=1, level=0)
+
+        full_pass_time_table = pd.concat({'vanilla': vanilla_full_pass_time_table,
+                                          'flash_attn': flash_full_pass_time_table}, axis=1)
+        full_pass_time_table = full_pass_time_table.swaplevel(0, 1, axis=1).sort_index(axis=1, level=0)
+
+        backward_time_table = full_pass_time_table - forward_time_table
+
+        forward_time_table.to_csv(f'../outputs/benchmark/forward_pass_{dtype}.csv')
+        backward_time_table.to_csv(f'../outputs/benchmark/backward_pass_{dtype}.csv')
+        full_pass_time_table.to_csv(f'../outputs/benchmark/full_pass_{dtype}.csv')
+
 
 if __name__ == "__main__":
-    benchmark_attention(True)
+    benchmarking_flash()
+    print('finished')
 

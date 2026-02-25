@@ -159,22 +159,25 @@ def flash_fwd_kernel(
 
 @triton.jit
 def flash_bwd_kernel(
-        Q_ptr, O_ptr, dO_ptr,
+        Q_ptr, dO_ptr,
         K_ptr, V_ptr,
         L_ptr, D_ptr,
+        dQ_ptr, dK_ptr, dV_ptr,
         stride_qb, stride_qq, stride_qd,
-        stride_ob, stride_oq, stride_od,
         stride_dob, stride_doq, stride_dod,
         stride_kb, stride_kk, stride_kd,
         stride_vb, stride_vk, stride_vd,
         stride_lb, stride_lq,
         stride_db, stride_dq,
+        stride_dqb, stride_dqq, stride_dqd,
+        stride_dkb, stride_dkk, stride_dkd,
+        stride_dvb, stride_dvk, stride_dvd,
         N_QUERIES, N_KEYS,
         scale,
         D: tl.constexpr,
         Q_TILE_SIZE: tl.constexpr,
         K_TILE_SIZE: tl.constexpr,
-        is_casual: bool,
+        is_casual: tl.constexpr
 ):
     key_tile_index = tl.program_id(0)
     batch_index = tl.program_id(1)
@@ -188,19 +191,10 @@ def flash_bwd_kernel(
         order=(1, 0)
     )
 
-    O_block_ptr = tl.make_block_ptr(
-        O_ptr + batch_index * stride_ob,
-        shape=(N_QUERIES, D),
-        strides=(stride_oq, stride_od),
-        offsets=(0, 0),
-        block_shape=(Q_TILE_SIZE, D),
-        order=(1, 0)
-    )
-
     dO_block_ptr = tl.make_block_ptr(
         dO_ptr + batch_index * stride_dob,
         shape=(N_QUERIES, D),
-        strides=(stride_doq, stride_od),
+        strides=(stride_doq, stride_dod),
         offsets=(0, 0),
         block_shape=(Q_TILE_SIZE, D),
         order=(1, 0)
@@ -242,6 +236,24 @@ def flash_bwd_kernel(
         order=(0,)
     )
 
+    dK_block_ptr = tl.make_block_ptr(
+        dK_ptr  + batch_index * stride_dkb,
+        shape=(N_KEYS, D),
+        strides=(stride_dkk, stride_dkd),
+        offsets=(key_tile_index * K_TILE_SIZE, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0)
+    )
+
+    dV_block_ptr = tl.make_block_ptr(
+        dV_ptr + batch_index * stride_dvb,
+        shape=(N_KEYS, D),
+        strides=(stride_dvk, stride_dvd),
+        offsets=(key_tile_index * K_TILE_SIZE, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0)
+    )
+
     K_tile = tl.load(K_block_ptr, boundary_check=(0,), padding_option="zero")
     V_tile = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
     dK_tile = tl.zeros((K_TILE_SIZE, D), dtype=tl.float32)
@@ -249,17 +261,37 @@ def flash_bwd_kernel(
 
     for i in range(tl.cdiv(N_QUERIES, Q_TILE_SIZE)):
         Q_tile = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")
-        O_tile = tl.load(O_block_ptr, boundary_check=(0,), padding_option="zero")
         dO_tile = tl.load(dO_block_ptr, boundary_check=(0,), padding_option="zero")
+        L_tile = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")
+        D_tile = tl.load(D_block_ptr, boundary_check=(0,), padding_option="zero")
 
-    # remain to be done
-    pass
+        S_tile = tl.dot(Q_tile, tl.trans(K_tile)) * scale
+        if is_casual:
+            query_index = i * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+            key_index = key_tile_index * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+            is_greater = query_index[:, None] >= key_index[None, :]
+            S_tile = tl.where(is_greater, S_tile, -1e6)
 
+        P_tile = tl.exp(S_tile - L_tile[:, None])
+        dV_tile = tl.dot(tl.trans(P_tile.to(dO_block_ptr.type.element_ty)), dO_tile, acc=dV_tile)
+        dP_tile = tl.dot(dO_tile, tl.trans(V_tile))
+        dS_tile = P_tile * (dP_tile - D_tile[:,None]) * scale
 
+        delta_tile = tl.dot(dS_tile.to(dK_block_ptr.type.element_ty), K_tile)
 
+        offsets = (tl.arange(0, Q_TILE_SIZE) * stride_dqq)[:, None] + (tl.arange(0, D) * stride_dqd)[None, :]
+        start_ptr = dQ_ptr + batch_index * stride_dqb + i * Q_TILE_SIZE * stride_dqq
+        tl.atomic_add(start_ptr + offsets, delta_tile)
 
+        dK_tile = tl.dot(tl.trans(dS_tile).to(Q_block_ptr.type.element_ty), Q_tile, acc=dK_tile)
 
+        Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
+        dO_block_ptr = dO_block_ptr.advance((Q_TILE_SIZE, 0))
+        L_block_ptr = L_block_ptr.advance((Q_TILE_SIZE,))
+        D_block_ptr = D_block_ptr.advance((Q_TILE_SIZE,))
 
+    tl.store(dK_block_ptr, dK_tile.to(dK_block_ptr.type.element_ty), boundary_check=(0,))
+    tl.store(dV_block_ptr, dV_tile.to(dV_block_ptr.type.element_ty), boundary_check=(0,))
 
 
 class TritonFlashAttention(torch.autograd.Function):
@@ -282,7 +314,7 @@ class TritonFlashAttention(torch.autograd.Function):
         assert NUM_K_TILES * ctx.K_TILE_SIZE == k_len, "key length must be divisible by tile size"
         assert k_len == v_len, "key length must be same as value length"
 
-        output = torch.empty(q.size(),device=q.device)
+        output = torch.empty(q.size(),device=q.device, dtype=v.dtype)
         logsumexp = torch.empty(q.size()[:-1], device=q.device)
 
         flash_fwd_kernel[(NUM_Q_TILES, batch_size)](
@@ -301,14 +333,44 @@ class TritonFlashAttention(torch.autograd.Function):
             is_casual
         )
 
-        ctx.save_for_backward(q, k, v, logsumexp)
+        ctx.save_for_backward(q, k, v, logsumexp, output)
         return output.view(q.shape)
 
     @staticmethod
-    @torch.compile
-    def backward(ctx, dO):
-        pass
+    def backward(ctx, do):
+        q, k, v, l, o = ctx.saved_tensors
+        batch_size = q.size(0)
 
+        dk = torch.empty(k.size(), device=k.device, dtype=k.dtype)
+        dv = torch.empty(v.size(), device=v.device, dtype=v.dtype)
+        dq = torch.zeros(q.size(), device=q.device, dtype=torch.float32)
+        d = (do * o).sum(axis=-1)
+
+        NUM_KEY_TILES = k.size(-2) // ctx.K_TILE_SIZE
+
+        flash_bwd_kernel[(NUM_KEY_TILES, batch_size)](
+            q, do,
+            k, v,
+            l, d,
+            dq, dk, dv,
+            q.stride(0), q.stride(1), q.stride(2),
+            do.stride(0), do.stride(1), do.stride(2),
+            k.stride(0), k.stride(1), k.stride(2),
+            v.stride(0), v.stride(1), v.stride(2),
+            l.stride(0), l.stride(1),
+            d.stride(0), d.stride(1),
+            dq.stride(0), dq.stride(1), dq.stride(2),
+            dk.stride(0), dk.stride(1), dk.stride(2),
+            dv.stride(0), dv.stride(1), dv.stride(2),
+            q.size(-2), k.size(-2),
+            ctx.scale,
+            q.size(-1),
+            ctx.Q_TILE_SIZE,
+            ctx.K_TILE_SIZE,
+            ctx.is_casual
+        )
+
+        return dq.to(q.dtype), dk, dv, None
 
 def _attention_and_lse(q, k, v, is_causal=False):
     from einops import einsum
@@ -329,16 +391,35 @@ def _attention_and_lse(q, k, v, is_causal=False):
     return o, L
 
 if __name__ == '__main__':
+    # quick local tests
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    q = torch.randn(1, 16, 16, device=device, requires_grad=True)
-    k = torch.randn(1, 16, 16, device=device, requires_grad=True)
-    v = torch.randn(1, 16 ,16, device=device, requires_grad=True)
-    do = torch.randn(1, 16, 16, device=device)
+    q = torch.randn(1, 32, 16, device=device, requires_grad=True, dtype=torch.bfloat16)
+    k = torch.randn(1, 32, 16, device=device, requires_grad=True, dtype=torch.bfloat16)
+    v = torch.randn(1, 32 ,16, device=device, requires_grad=True, dtype=torch.bfloat16)
+    do = torch.randn(1, 32, 16, device=device, dtype=torch.bfloat16)
 
-    x1 = PyTorchFlashAttention.apply(q, k, v, False)
-    x2 = x1.backward(do)
-    # x2 = TritonFlashAttention.apply(q, k, v, False)
+    x1 = TritonFlashAttention.apply(q, k, v, True)
+    x1.backward(do)
+    q_grad1 = q.grad
+    k_grad1 = k.grad
+    v_grad1 = v.grad
 
-    # x3 = _attention_and_lse(q, k, v, True)[0]
-    # x4 = TritonFlashAttention.apply(q, k, v, True)
-    print('finished')
+    q.grad = None
+    k.grad = None
+    v.grad = None
+
+    x2 = _attention_and_lse(q, k, v, True)[0]
+    x2.backward(do)
+    q_grad2 = q.grad
+    k_grad2 = k.grad
+    v_grad2 = v.grad
+    torch.testing.assert_close(q_grad2, q_grad1, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(k_grad2, k_grad1, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(v_grad2, v_grad1, rtol=1e-2, atol=1e-2)
+
+    # x1 = PyTorchFlashAttention.apply(q, k, v, False)
+    # x2 = x1.backward(do)
+    # # x2 = TritonFlashAttention.apply(q, k, v, False)
+    #
+    # # x3 = _attention_and_lse(q, k, v, True)[0]
+    # # x4 = TritonFlashAttentioevery
