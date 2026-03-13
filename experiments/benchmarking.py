@@ -1,11 +1,15 @@
+import copy
 import timeit
-
+import os
 import einx
 import numpy as np
 import torch
 import triton
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
-from cs336_basics.module import MultiheadSelfAttention
+from cs336_basics.module import MultiheadSelfAttention, TransformerLM
+from cs336_basics.optimizer import AdamW
 
 from cs336_basics.utils import scaled_dot_product_attention
 
@@ -13,6 +17,7 @@ from cs336_systems.FlashAttention import TritonFlashAttention
 from cs336_systems.monitoring import monitor_transformer
 import pandas as pd
 
+from cs336_systems.ddp import DDP
 from experiments.params import PARAM_MAP
 
 
@@ -249,7 +254,214 @@ def benchmarking_flash():
         full_pass_time_table.to_csv(f'../outputs/benchmark/full_pass_{dtype}.csv')
 
 
+def setup(rank: int, world_size: int, device_name: str):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "29505"
+
+    if device_name == "cuda" and torch.cuda.is_available():
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        torch.cuda.set_device(rank)
+    else:
+        dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+def all_reduce(rank: int, world_size: int, num_elements: int, device_name: str):
+    setup(rank, world_size, device_name)
+    tensor = torch.randn(num_elements, dtype=torch.float32)
+    warm_up_steps = 5
+    if device_name == 'cuda' and torch.cuda.is_available():
+        tensor = tensor.to(device_name)
+    for _ in range(warm_up_steps):
+        dist.all_reduce(tensor=tensor, op=dist.ReduceOp.SUM, async_op=False)
+
+    if device_name == 'cuda' and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    dist.barrier()
+
+    start_time = timeit.default_timer()
+    dist.all_reduce(tensor=tensor, op=dist.ReduceOp.SUM, async_op=False)
+    if device_name == 'cuda' and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    dist.barrier()
+    end_time = timeit.default_timer()
+
+    duration = end_time - start_time
+    print(f'rank {rank} duration: {duration:4f} seconds')
+    all_durations = [None for _ in range(world_size)]
+    dist.all_gather_object(all_durations, duration)
+    avg = sum(all_durations) / len(all_durations)
+    print(f"rank {rank}: mean duration {avg:4f} seconds")
+
+
+def benchmark_all_reduce(mode="cpu"):
+    for world_size in [2, 4, 6]:
+        print("working with world size", world_size)
+        if mode=="gpu" and torch.cuda.is_available() and torch.cuda.device_count() < world_size:
+            print('skipped world size', world_size)
+            continue
+        for data_byte_size in [10 ** 6, 10 ** 7, 10 ** 8, 10 ** 9]:
+            num_mb = round(data_byte_size / 1e6)
+            print(f"data size: {num_mb:0f} MB")
+            num_elements = data_byte_size // 8
+            mp.spawn(fn=all_reduce, args=(world_size, num_elements, 'cpu'), nprocs=world_size, join=True)
+        print("=" * 30)
+
+def benchmark_dist_train_model(fn, additional_args: tuple, device_type: str='cpu'):
+    vocab_size = 10000
+    # d_model = 1600
+    # num_layers = 48
+    # num_heads = 25
+    # d_ff = 6400
+    # context_length = 512
+
+    # toy model params for cpu testing
+    d_model = 16
+    num_layers = 4
+    num_heads = 4
+    d_ff = 32
+    context_length = 512
+
+    theta=10000
+    world_size = 2
+    batch_size = 16
+
+    rng = np.random.default_rng()
+    random_data = torch.tensor(rng.integers(0, vocab_size, size=(batch_size, context_length)),
+                               dtype=torch.long)
+
+    if device_type == 'cuda' and torch.cuda.is_available() and torch.cuda.device_count() >= world_size:
+        device = torch.device(device_type)
+    elif device_type != 'cpu':
+        print("current device type not supported, switched to cpu mode")
+        device = torch.device(device_type)
+        device_type = 'cpu'
+    else:
+        device = torch.device(device_type)
+
+    lm = TransformerLM(vocab_size, d_model, num_layers, num_heads, d_ff, context_length, theta, device=device)
+    args = (world_size, 5, lm, random_data, device_type) + additional_args
+    mp.spawn(fn=fn, args=args, nprocs=world_size, join=True)
+
+def naive_dist_training(rank: int, world_size: int, warmup_steps: int, model: torch.nn.Module, data: torch.tensor,
+                  device_type: str, shared_dict=None, tracking_op=None, use_flatten=False):
+    if tracking_op is not None and tracking_op not in ['full_step', 'communication']:
+        raise ValueError('Unknown tracking operation')
+    setup(rank, world_size, device_type)
+    batch_size = data.size(0) // world_size
+    start_idx = rank * batch_size
+    end_idx = start_idx + batch_size
+    data_batch = data[start_idx:end_idx]
+    data_batch = data_batch.to(device_type)
+    assert len(data_batch) == batch_size
+
+    rank_model = copy.deepcopy(model)
+    rank_model = rank_model.to(device_type)
+    optimizer = AdamW(rank_model.parameters(), lr=1e-3, betas=(0.9, 0.999), weight_decay=0.01)
+    all_run_time = [None for _ in range(world_size)]
+    for i in range(warmup_steps + 1):
+        if i == warmup_steps and tracking_op == 'full_step':
+            dist.barrier()
+            start_time = timeit.default_timer()
+        optimizer.zero_grad()
+        output = rank_model(data_batch)
+        loss = (output * output).mean()
+        loss.backward()
+
+        if i == warmup_steps and tracking_op == 'communication':
+            dist.barrier()
+            start_time = timeit.default_timer()
+        if use_flatten:
+            flattened_grads = []
+            for p in rank_model.parameters():
+                if p.grad is not None:
+                    flattened_grads.append(p.grad.flatten())
+            flattened_grads = torch.concat(flattened_grads)
+            if device_type == 'cuda':
+                dist.all_reduce(flattened_grads, op=dist.ReduceOp.AVG, async_op=False)
+            else:
+                dist.all_reduce(flattened_grads, op=dist.ReduceOp.SUM, async_op=False)
+        else:
+            for p in rank_model.parameters():
+                if p.grad is not None:
+                    if device_type == 'cuda':
+                        dist.all_reduce(tensor=p.grad, op=dist.ReduceOp.AVG, async_op=False)
+                    else:
+                        dist.all_reduce(tensor=p.grad, op=dist.ReduceOp.SUM, async_op=False)
+
+        if i == warmup_steps and tracking_op == 'communication':
+            dist.barrier()
+            end_time = timeit.default_timer()
+            dist.all_gather_object(all_run_time, end_time - start_time)
+
+        if use_flatten:
+            if device_type != 'cuda':
+                flattened_grads = flattened_grads / world_size
+            offset = 0
+            for p in rank_model.parameters():
+                if p.grad is not None:
+                    p.grad = flattened_grads[offset : (offset + p.grad.numel())].view(p.size())
+                    offset += p.grad.numel()
+        else:
+            if device_type != 'cuda':
+                for p in rank_model.parameters():
+                    if p.grad is not None:
+                        p.grad = p.grad / world_size
+
+        optimizer.step()
+        if i == warmup_steps and tracking_op == 'full_step':
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            dist.barrier()
+            end_time = timeit.default_timer()
+            dist.all_gather_object(all_run_time, end_time - start_time)
+
+    if rank == 0:
+        if shared_dict is not None:
+            shared_dict['result'] = rank_model.to('cpu').state_dict()
+        if tracking_op is not None:
+            avg_time = sum(all_run_time) / len(all_run_time)
+            print(f'average run time: {avg_time}')
+
+
+def dist_training_with_ddp(rank: int, world_size: int, warmup_steps: int, model: torch.nn.Module, data: torch.tensor,
+                           device_type: str):
+    setup(rank, world_size, device_type)
+    batch_size = data.size(0) // world_size
+    start_idx = rank * batch_size
+    end_idx = start_idx + batch_size
+    data_batch = data[start_idx:end_idx]
+    data_batch = data_batch.to(device_type)
+    assert len(data_batch) == batch_size
+
+    rank_model = copy.deepcopy(model)
+    rank_model = DDP(rank_model.to(device_type))
+    optimizer = AdamW(rank_model.parameters(), lr=1e-3, betas=(0.9, 0.999), weight_decay=0.01)
+    all_run_time = [None for _ in range(world_size)]
+    for i in range(warmup_steps + 1):
+        if i == warmup_steps:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            dist.barrier()
+            start_time = timeit.default_timer()
+
+        optimizer.zero_grad()
+        output = rank_model(data_batch)
+        loss = (output * output).mean()
+        loss.backward()
+        rank_model.finish_gradient_synchronization()
+        optimizer.step()
+
+        if i == warmup_steps:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            dist.barrier()
+            end_time = timeit.default_timer()
+            dist.all_gather_object(all_run_time, end_time - start_time)
+
+    if rank == 0:
+        avg_time = sum(all_run_time) / len(all_run_time)
+        print(f'average run time: {avg_time}')
+
 if __name__ == "__main__":
-    benchmarking_flash()
+    benchmark_dist_train_model(dist_training_with_ddp, ())
     print('finished')
 
