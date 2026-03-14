@@ -119,7 +119,9 @@ def ddp_bucketed_on_train_batch_start(ddp_model: torch.nn.Module, optimizer: tor
         optimizer: torch.optim.Optimizer
             Optimizer being used with the DDP-wrapped model.
     """
-    raise NotImplementedError
+    for i in range(len(ddp_model.bucket_tensors)):
+        ddp_model.bucket_tensors[i] = torch.empty(ddp_model.bucket_tensors[i].size(), device=ddp_model.bucket_tensors[i].device)
+        ddp_model.counter[i] = 0
 
 
 def get_sharded_optimizer(params, optimizer_cls: Type[torch.optim.Optimizer], **kwargs) -> torch.optim.Optimizer:
