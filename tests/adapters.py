@@ -5,7 +5,7 @@ from typing import Type
 import torch
 
 from cs336_systems import FlashAttention
-from cs336_systems.ddp import DDP, BucketDDP
+from cs336_systems.ddp import DDP, BucketDDP, DistributedOptimizer
 
 
 def get_flashattention_autograd_function_pytorch() -> Type:
@@ -140,4 +140,4 @@ def get_sharded_optimizer(params, optimizer_cls: Type[torch.optim.Optimizer], **
     Returns:
         Instance of sharded optimizer.
     """
-    raise NotImplementedError
+    return DistributedOptimizer(params, optimizer_cls, **kwargs)

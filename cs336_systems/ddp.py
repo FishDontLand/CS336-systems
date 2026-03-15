@@ -1,5 +1,6 @@
 import timeit
-from typing import Iterator
+from collections import defaultdict
+from typing import Iterator, Type, Any, Optional, Callable
 
 import torch
 import torch.distributed as dist
@@ -9,6 +10,7 @@ import torch.multiprocessing as mp
 import os
 from cs336_basics.optimizer import AdamW
 from torch.nn import Parameter
+from torch.optim import Optimizer
 
 
 def setup(rank: int, world_size: int, device_type: str):
@@ -341,6 +343,113 @@ class BucketDDP(torch.nn.Module):
             p.grad = restored_param.view(p.size())
             if not self.is_cuda:
                 p.grad /= dist.get_world_size()
+
+class DistributedOptimizer(torch.optim.Optimizer):
+    def __init__(self, params, optimizer_cls: Type[Optimizer], **kwargs: Any):
+        super().__init__(params, kwargs)
+        self.kwargs = kwargs
+        self.world_size = dist.get_world_size()
+        self.optimizer_state = None
+        self.optimizer_cls = optimizer_cls
+        self.rank = dist.get_rank()
+
+    def step(self, closure: Optional[Callable]=None, **kwargs):
+        loss = None if closure is None else closure()
+
+        handles = []
+        rank_group_lst = []
+        tensor_mapping = dict()
+
+        for group in self.param_groups:
+            rank_group = dict()
+            for name in group:
+                if name != 'params':
+                    rank_group[name] = group[name]
+                else:
+                    rank_params = []
+                    for idx, p in enumerate(group['params']):
+                        if p.grad is None:
+                            continue
+
+                        num_param_per_rank = p.numel() // self.world_size
+                        if num_param_per_rank * self.world_size < p.numel():
+                            num_param_per_rank += 1
+                            padding_size = p.numel() - num_param_per_rank * self.world_size
+                            p_data_flatten = torch.concat([p.data.flatten(),
+                                                      torch.empty(padding_size,
+                                                                  dtype=p.data.dtype, device=p.device)])
+                            p_grad_flatten = torch.concat([p.grad.flatten(),
+                                                           torch.empty(padding_size,
+                                                                       dtype=p.grad.dtype,
+                                                                       device=p.device)])
+                        else:
+                            p_data_flatten = p.data.flatten()
+                            p_grad_flatten = p.grad.flatten()
+
+
+                        sub_p_grad = torch.empty(num_param_per_rank, dtype=p.grad.dtype, device=p.device)
+                        rank_data = p_data_flatten[self.rank * num_param_per_rank:(self.rank + 1) * num_param_per_rank]
+                        sub_p = torch.nn.parameter.Parameter(data=rank_data)
+                        sub_p.grad = sub_p_grad
+                        rank_params.append(sub_p)
+                        tensor_mapping[p] = sub_p
+
+                        if sub_p.is_cuda:
+                            p_grad_handle = dist.reduce_scatter_tensor(sub_p.grad, p_grad_flatten,
+                                                                       op=dist.ReduceOp.AVG, async_op=True)
+                            handles.append(p_grad_handle)
+                        else:
+                            p_grad_handle = dist.reduce_scatter_tensor(sub_p.grad, p_grad_flatten,
+                                                                       op=dist.ReduceOp.SUM, async_op=True)
+                            handles.append(p_grad_handle)
+                    rank_group['params'] = rank_params
+
+            rank_group_lst.append(rank_group)
+
+        for handle in handles:
+            handle.wait()
+        handles.clear()
+
+        for group in rank_group_lst:
+            for idx, p in enumerate(group['params']):
+                if p.grad is None:
+                    continue
+                if not p.is_cuda:
+                    p.grad = p.grad / self.world_size
+
+        optimizer = self.optimizer_cls(rank_group_lst, **self.kwargs, **kwargs)
+
+        if self.optimizer_state is not None:
+            optimizer.load_state_dict(self.optimizer_state)
+
+        optimizer.step()
+
+        self.optimizer_state = optimizer.state_dict()
+
+        rev_tensor_mapping = {v: k for k, v in tensor_mapping.items()}
+
+        new_params = dict()
+        for group in optimizer.param_groups:
+            for p in group['params']:
+                full_p = torch.empty(p.size(0) * self.world_size, dtype=p.data.dtype, device=p.device)
+                handles.append(dist.all_gather_into_tensor(full_p, p.data, async_op=True))
+                new_params[rev_tensor_mapping[p]] = full_p
+
+        for handle in handles:
+            handle.wait()
+        handles.clear()
+
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                p.data = new_params[p][:p.numel()].view(p.size())
+
+        return loss
+
+    def add_param_group(self, param_group):
+        self.param_groups.append(param_group)
+
 
 if __name__ == '__main__':
     pass
